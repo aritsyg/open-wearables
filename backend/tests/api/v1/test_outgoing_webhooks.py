@@ -413,6 +413,48 @@ class TestOutgoingWebhooksAPI:
         assert resp.status_code == 200
         assert len(resp.json()) == 2
 
+    def test_list_endpoints_follows_svix_pagination(
+        self,
+        client: TestClient,
+        db: Session,
+        mock_svix: MagicMock,
+    ) -> None:
+        developer = DeveloperFactory()
+        token = create_access_token(developer.id)
+
+        def ep(n: int) -> MagicMock:
+            return MagicMock(id=f"ep_{n}", url=f"https://example.com/wh/{n}", description=None, filter_types=None)
+
+        mock_svix.list_endpoints.side_effect = [
+            MagicMock(data=[ep(1), ep(2)], done=False, iterator="it_1"),
+            MagicMock(data=[ep(3)], done=True, iterator=None),
+        ]
+
+        resp = client.get(
+            "/api/v1/webhooks/endpoints",
+            headers={"Authorization": f"Bearer {token}"},
+        )
+
+        assert resp.status_code == 200
+        assert [e["id"] for e in resp.json()] == ["ep_1", "ep_2", "ep_3"]
+        assert [c.kwargs["iterator"] for c in mock_svix.list_endpoints.call_args_list] == [None, "it_1"]
+
+    def test_list_endpoints_stops_on_repeated_iterator(
+        self,
+        client: TestClient,
+        db: Session,
+        mock_svix: MagicMock,
+    ) -> None:
+        developer = DeveloperFactory()
+        token = create_access_token(developer.id)
+        mock_svix.list_endpoints.return_value = MagicMock(data=[], done=False, iterator="it_1")
+
+        with pytest.raises(RuntimeError, match="same endpoint list iterator"):
+            client.get(
+                "/api/v1/webhooks/endpoints",
+                headers={"Authorization": f"Bearer {token}"},
+            )
+
     def test_delete_endpoint(
         self,
         client: TestClient,
