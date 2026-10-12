@@ -5,6 +5,7 @@ from uuid import UUID, uuid4
 
 from celery import shared_task
 from sqlalchemy import text
+from sqlalchemy.orm import Session
 
 from app.algorithms.config_algorithms import resilience_config
 from app.config import settings
@@ -20,6 +21,13 @@ logger = getLogger(__name__)
 
 _RMSSD_TYPE_ID = get_series_type_id(SeriesType.heart_rate_variability_rmssd)
 _SDNN_TYPE_ID = get_series_type_id(SeriesType.heart_rate_variability_sdnn)
+
+# Users scored per batch: each batch costs one sleep-records query, one RMSSD query and
+# one INSERT. RMSSD can arrive every ~5 min overnight (~100 samples/night), so a batch
+# loads up to about users * (score_backfill_days + lookback_days) * 100 ≈ 370k rows at
+# 100 users with the defaults — small enough for a worker, large enough that the query
+# count stops mattering.
+_USER_CHUNK_SIZE = 100
 
 # Find all (user, reference_date) pairs that are missing an OW resilience score.
 # active_users: users who have any RMSSD or SDNN data in the extended lookback window.
@@ -95,57 +103,37 @@ def fill_missing_resilience_scores() -> dict[str, int]:
         total_saved = 0
         total_skipped = 0
 
-        for uid, reference_dates in dates_by_user.items():
+        user_ids = list(dates_by_user)
+        for chunk_start in range(0, len(user_ids), _USER_CHUNK_SIZE):
+            chunk = {uid: dates_by_user[uid] for uid in user_ids[chunk_start : chunk_start + _USER_CHUNK_SIZE]}
             try:
-                scores_by_date = resilience_score_service.get_hrv_cv_scores_for_date_range(db, uid, reference_dates)
+                saved = _score_users(db, chunk)
             except Exception as e:
-                total_skipped += len(reference_dates)
-                log_and_capture_error(
-                    e,
-                    logger,
-                    f"Failed to fetch HRV data for user {uid}",
-                    extra={"user_id": str(uid), "task": "fill_missing_resilience_scores"},
-                )
-                continue
-
-            scores_to_save = [
-                HealthScoreCreate(
-                    id=uuid4(),
-                    user_id=uid,
-                    data_source_id=None,
-                    provider=ProviderName.INTERNAL,
-                    category=HealthScoreCategory.RESILIENCE,
-                    value=result.hrv_cv,
-                    recorded_at=datetime(ref_date.year, ref_date.month, ref_date.day, tzinfo=timezone.utc),
-                    components={
-                        "days_counted": ScoreComponent(value=result.days_counted),
-                        "metric_type": ScoreComponent(qualifier=result.metric_type),
-                        "resilience_score": ScoreComponent(value=result.resilience_score),
-                    },
-                )
-                for ref_date, result in scores_by_date.items()
-                if result.hrv_cv is not None
-            ]
-
-            # Dates with hrv_cv=None have insufficient data — leave unscored for retry.
-            total_skipped += len(reference_dates) - len(scores_to_save)
-
-            if not scores_to_save:
-                continue
-
-            try:
-                health_score_service.bulk_create(db, scores_to_save)
-                db.commit()
-                total_saved += len(scores_to_save)
-            except Exception as e:
+                # Fall back to one user at a time so a single bad user only skips themself,
+                # instead of blocking the whole chunk on every run.
                 db.rollback()
-                total_skipped += len(scores_to_save)
-                log_and_capture_error(
-                    e,
+                log_structured(
                     logger,
-                    f"Failed to save resilience scores for user {uid}",
-                    extra={"user_id": str(uid), "task": "fill_missing_resilience_scores"},
+                    "warning",
+                    f"Batched resilience scoring failed for {len(chunk)} user(s), retrying per user: {e}",
+                    task="fill_missing_resilience_scores",
                 )
+                saved = 0
+                for uid, reference_dates in chunk.items():
+                    try:
+                        saved += _score_users(db, {uid: reference_dates})
+                    except Exception as user_error:
+                        db.rollback()
+                        log_and_capture_error(
+                            user_error,
+                            logger,
+                            f"Failed to calculate resilience scores for user {uid}",
+                            extra={"user_id": str(uid), "task": "fill_missing_resilience_scores"},
+                        )
+
+            total_saved += saved
+            # Dates with hrv_cv=None have insufficient data — leave unscored for retry.
+            total_skipped += sum(len(reference_dates) for reference_dates in chunk.values()) - saved
 
         log_structured(
             logger,
@@ -157,3 +145,36 @@ def fill_missing_resilience_scores() -> dict[str, int]:
         )
 
         return {"saved": total_saved, "skipped": total_skipped}
+
+
+def _score_users(db: Session, dates_by_user: dict[UUID, list[date]]) -> int:
+    """Calculate and persist resilience scores for a group of users; return how many were saved.
+
+    Commits on success. Raises on any fetch or save failure, leaving the rollback to the caller.
+    """
+    scores_by_user = resilience_score_service.get_hrv_cv_scores_for_users(db, dates_by_user)
+
+    scores_to_save = [
+        HealthScoreCreate(
+            id=uuid4(),
+            user_id=uid,
+            data_source_id=None,
+            provider=ProviderName.INTERNAL,
+            category=HealthScoreCategory.RESILIENCE,
+            value=result.hrv_cv,
+            recorded_at=datetime(ref_date.year, ref_date.month, ref_date.day, tzinfo=timezone.utc),
+            components={
+                "days_counted": ScoreComponent(value=result.days_counted),
+                "metric_type": ScoreComponent(qualifier=result.metric_type),
+                "resilience_score": ScoreComponent(value=result.resilience_score),
+            },
+        )
+        for uid, scores_by_date in scores_by_user.items()
+        for ref_date, result in scores_by_date.items()
+        if result.hrv_cv is not None
+    ]
+
+    if scores_to_save:
+        health_score_service.bulk_create(db, scores_to_save)
+        db.commit()
+    return len(scores_to_save)

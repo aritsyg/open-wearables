@@ -4,8 +4,8 @@ Covers three layers:
 - Pure helpers (_ensure_utc, _filter_points_to_windows, _group_by_day,
   _extract_asleep_windows, _empty_daily_scores) — no DB.
 - Pure scoring helper (_hrv_cv_to_resilience_score) — no DB.
-- DB-backed methods (get_hrv_cv_score, calculate_rmssd_ow, calculate_sdnn_ow)
-  using real Postgres via testcontainers with transaction-rollback isolation.
+- DB-backed methods (get_hrv_cv_score, get_hrv_cv_scores_for_users, calculate_rmssd_ow,
+  calculate_sdnn_ow) using real Postgres via testcontainers with transaction-rollback isolation.
 """
 
 import logging
@@ -772,6 +772,101 @@ class TestGetHrvCvScore:
         score_for_day = next(s for s in result.daily_scores if s.date == target_day)
         assert score_for_day.has_data is True
         assert score_for_day.hrv_value_ms == pytest.approx(45.0)
+
+
+# ---------------------------------------------------------------------------
+# DB-backed: get_hrv_cv_scores_for_users (batched across users)
+# ---------------------------------------------------------------------------
+
+
+class TestGetHrvCvScoresForUsers:
+    """The batched path must give each user exactly the single-user result."""
+
+    def _add_sleep_with_hrv(
+        self,
+        data_source: DataSource,
+        rmssd_type: SeriesTypeDefinition,
+        night: date,
+        value: float,
+    ) -> None:
+        record = EventRecordFactory(
+            category="sleep",
+            type_="sleep",
+            start_datetime=datetime.combine(night, time(0), tzinfo=timezone.utc),
+            end_datetime=datetime.combine(night, time(8), tzinfo=timezone.utc),
+            data_source=data_source,
+        )
+        SleepDetailsFactory(event_record=record, sleep_stages=None)
+        DataPointSeriesFactory(
+            data_source=data_source,
+            series_type=rmssd_type,
+            recorded_at=datetime.combine(night, time(2), tzinfo=timezone.utc),
+            value=Decimal(str(value)),
+        )
+
+    def test_empty_input_returns_empty(self, db: Session) -> None:
+        assert service.get_hrv_cv_scores_for_users(db, {}) == {}
+        assert service.get_hrv_cv_scores_for_users(db, {UserFactory().id: []}) == {}
+
+    def test_matches_single_user_results(self, db: Session) -> None:
+        rmssd_type = SeriesTypeDefinitionFactory.get_or_create_heart_rate_variability_rmssd()
+        ref = date(2026, 3, 20)
+        dates_by_user = {}
+        for offset in range(3):
+            ds = DataSourceFactory(user=UserFactory())
+            for days_back in range(1, 12):
+                self._add_sleep_with_hrv(ds, rmssd_type, ref - timedelta(days=days_back), 40 + offset * days_back)
+            dates_by_user[ds.user_id] = [ref - timedelta(days=i) for i in range(5)]
+        db.flush()
+
+        batched = service.get_hrv_cv_scores_for_users(db, dates_by_user)
+
+        assert batched == {
+            user_id: service.get_hrv_cv_scores_for_date_range(db, user_id, dates)
+            for user_id, dates in dates_by_user.items()
+        }
+        assert all(r.hrv_cv is not None for results in batched.values() for r in results.values())
+
+    def test_rows_outside_a_users_own_window_are_ignored(self, db: Session) -> None:
+        """Users with different date ranges share one fetch window; each must only see its own."""
+        rmssd_type = SeriesTypeDefinitionFactory.get_or_create_heart_rate_variability_rmssd()
+        early_ref = date(2026, 3, 10)  # own window [03-03, 03-10)
+        late_ref = date(2026, 3, 25)  # own window [03-18, 03-25)
+
+        early = DataSourceFactory(user=UserFactory())
+        # Sleep-filtered RMSSD after the early user's window, inside the shared one.
+        self._add_sleep_with_hrv(early, rmssd_type, date(2026, 3, 20), 45)
+        # A session after the window whose (inconsistent) stage lies inside it.
+        record = EventRecordFactory(
+            category="sleep",
+            type_="sleep",
+            start_datetime=_utc("2026-03-12T00:00:00"),
+            end_datetime=_utc("2026-03-12T08:00:00"),
+            data_source=early,
+        )
+        SleepDetailsFactory(
+            event_record=record,
+            sleep_stages=[_make_stage_dict("light", "2026-03-09T02:00:00+00:00", "2026-03-09T03:00:00+00:00")],
+        )
+        DataPointSeriesFactory(
+            data_source=early,
+            series_type=rmssd_type,
+            recorded_at=_utc("2026-03-09T02:30:00"),
+            value=Decimal("45"),
+        )
+
+        late = DataSourceFactory(user=UserFactory())
+        for days_back in range(1, 7):
+            self._add_sleep_with_hrv(late, rmssd_type, late_ref - timedelta(days=days_back), 40 + days_back)
+        db.flush()
+
+        batched = service.get_hrv_cv_scores_for_users(db, {early.user_id: [early_ref], late.user_id: [late_ref]})
+
+        assert batched[early.user_id] == service.get_hrv_cv_scores_for_date_range(db, early.user_id, [early_ref])
+        assert batched[early.user_id][early_ref].days_counted == 0
+        assert batched[early.user_id][early_ref].metric_type is None
+        assert batched[late.user_id] == service.get_hrv_cv_scores_for_date_range(db, late.user_id, [late_ref])
+        assert batched[late.user_id][late_ref].hrv_cv is not None
 
 
 # ---------------------------------------------------------------------------

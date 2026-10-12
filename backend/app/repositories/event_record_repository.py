@@ -1,4 +1,5 @@
 import contextlib
+from collections import defaultdict
 from datetime import date, datetime, timedelta
 from decimal import Decimal
 from uuid import UUID
@@ -1172,16 +1173,32 @@ class EventRecordRepository(
 
         Uses an outerjoin so sessions with no stage data are still included.
         """
+        return self.get_sleep_records_with_details_for_users(db_session, [user_id], start_dt, end_dt).get(user_id, [])
+
+    def get_sleep_records_with_details_for_users(
+        self,
+        db_session: DbSession,
+        user_ids: list[UUID],
+        start_dt: datetime,
+        end_dt: datetime,
+    ) -> dict[UUID, list[tuple[EventRecord, SleepDetails | None]]]:
+        """Batched get_sleep_records_with_details: one query for many users, grouped by user_id.
+
+        Users with no matching sleep records are absent from the returned dict.
+        """
         rows = (
-            db_session.query(EventRecord, SleepDetails)
+            db_session.query(DataSource.user_id, EventRecord, SleepDetails)
             .join(DataSource, EventRecord.data_source_id == DataSource.id)
             .outerjoin(SleepDetails, SleepDetails.record_id == EventRecord.id)
             .filter(
-                DataSource.user_id == user_id,
+                DataSource.user_id.in_(user_ids),
                 EventRecord.category == "sleep",
                 EventRecord.end_datetime >= start_dt,
                 EventRecord.start_datetime < end_dt,
             )
             .all()
         )
-        return [(event_record, sleep_details) for event_record, sleep_details in rows]
+        by_user: dict[UUID, list[tuple[EventRecord, SleepDetails | None]]] = defaultdict(list)
+        for user_id, event_record, sleep_details in rows:
+            by_user[user_id].append((event_record, sleep_details))
+        return dict(by_user)

@@ -29,7 +29,7 @@ from app.algorithms.config_algorithms import resilience_config
 from app.algorithms.resilience import calculate_hrv_cv, calculate_rmssd, calculate_sdnn
 from app.constants.sleep import SleepStageType
 from app.database import DbSession
-from app.models import DataPointSeries, EventRecord
+from app.models import DataPointSeries, EventRecord, SleepDetails
 from app.repositories import DataPointSeriesRepository, EventRecordRepository
 from app.schemas.enums import SeriesType, get_series_type_id
 from app.schemas.model_crud.activities.sleep import SleepStage
@@ -99,7 +99,14 @@ class ResilienceScoreService:
         asleep window (conservative fallback).
         """
         records = self._event_record_repo.get_sleep_records_with_details(db_session, user_id, start_dt, end_dt)
+        return self._windows_from_sleep_records(records, allowed_stages)
 
+    def _windows_from_sleep_records(
+        self,
+        records: list[tuple[EventRecord, SleepDetails | None]],
+        allowed_stages: frozenset[SleepStageType],
+    ) -> list[tuple[datetime, datetime]]:
+        """Extract allowed-stage windows from already-fetched sleep EventRecords."""
         windows: list[tuple[datetime, datetime]] = []
 
         for record, details in records:
@@ -412,33 +419,83 @@ class ResilienceScoreService:
         Returns a dict mapping each reference_date to its HrvCvScoreResult.
         Dates with insufficient data have hrv_cv=None in the result.
         """
-        if not reference_dates:
+        return self.get_hrv_cv_scores_for_users(db_session, {user_id: reference_dates}).get(user_id, {})
+
+    def get_hrv_cv_scores_for_users(
+        self,
+        db_session: DbSession,
+        dates_by_user: dict[UUID, list[date]],
+    ) -> dict[UUID, dict[date, HrvCvScoreResult]]:
+        """Batched get_hrv_cv_scores_for_date_range: two DB queries for any number of users.
+
+        Sleep records and RMSSD samples for every user are fetched in one query each,
+        over the union of the users' windows. Each user's rows are then narrowed back
+        to that user's own window, so the results are identical to calling
+        get_hrv_cv_scores_for_date_range per user.
+
+        Users with no reference dates are absent from the returned dict.
+        """
+        user_windows = {
+            user_id: self._date_range_fetch_window(reference_dates)
+            for user_id, reference_dates in dates_by_user.items()
+            if reference_dates
+        }
+        if not user_windows:
             return {}
 
-        earliest = min(reference_dates)
-        latest = max(reference_dates)
+        user_ids = list(user_windows)
+        start_dt = min(user_start for user_start, _ in user_windows.values())
+        end_dt = max(user_end for _, user_end in user_windows.values())
 
+        records_by_user = self._event_record_repo.get_sleep_records_with_details_for_users(
+            db_session, user_ids, start_dt, end_dt
+        )
+        rmssd_type_id = get_series_type_id(SeriesType.heart_rate_variability_rmssd)
+        hrv_by_user = self._data_point_repo.query_series_for_users(
+            db_session, user_ids, rmssd_type_id, start_dt, end_dt
+        )
+
+        results: dict[UUID, dict[date, HrvCvScoreResult]] = {}
+        for user_id, (user_start, user_end) in user_windows.items():
+            # Same overlap / half-open predicates as the repository queries.
+            records = [
+                (record, details)
+                for record, details in records_by_user.get(user_id, [])
+                if self._ensure_utc(record.end_datetime) >= user_start
+                and self._ensure_utc(record.start_datetime) < user_end
+            ]
+            hrv_pts = [
+                (ts, value)
+                for ts, value in hrv_by_user.get(user_id, [])
+                if user_start <= self._ensure_utc(ts) < user_end
+            ]
+            windows = self._windows_from_sleep_records(records, _ASLEEP_STAGES)
+            results[user_id] = self._hrv_cv_scores_from_samples(dates_by_user[user_id], windows, hrv_pts)
+
+        return results
+
+    def _date_range_fetch_window(self, reference_dates: list[date]) -> tuple[datetime, datetime]:
+        """Return the [start, end) UTC window covering the lookback of every reference date."""
         start_dt = datetime.combine(
-            earliest - timedelta(days=resilience_config.lookback_days),
+            min(reference_dates) - timedelta(days=resilience_config.lookback_days),
             time.min,
             tzinfo=timezone.utc,
         )
-        end_dt = datetime.combine(latest, time.min, tzinfo=timezone.utc)
+        end_dt = datetime.combine(max(reference_dates), time.min, tzinfo=timezone.utc)
+        return start_dt, end_dt
 
-        # Fetch sleep windows and HRV data once for the full combined window.
-        windows = self._extract_asleep_windows(db_session, user_id, start_dt, end_dt, _ASLEEP_STAGES)
-
-        rmssd_type_id = get_series_type_id(SeriesType.heart_rate_variability_rmssd)
-        hrv_pts = self._query_data_series(db_session, user_id, rmssd_type_id, start_dt, end_dt)
+    def _hrv_cv_scores_from_samples(
+        self,
+        reference_dates: list[date],
+        windows: list[tuple[datetime, datetime]],
+        hrv_pts: list[tuple[datetime, float]],
+    ) -> dict[date, HrvCvScoreResult]:
+        """Compute per-reference-date HRV-CV from one user's sleep windows and RMSSD samples."""
         filtered_hrv = self._filter_points_to_windows(hrv_pts, windows)
         metric_type: str = "RMSSD"
 
-        # NOTE: SDNN fallback is disabled pending validation — only RMSSD is used for now.
-        # if not filtered_hrv:
-        #     sdnn_type_id = get_series_type_id(SeriesType.heart_rate_variability_sdnn)
-        #     sdnn_pts = self._query_data_series(db_session, user_id, sdnn_type_id, start_dt, end_dt)
-        #     filtered_hrv = self._filter_points_to_windows(sdnn_pts, windows)
-        #     metric_type = "SDNN"
+        # NOTE: SDNN fallback is disabled pending validation — only RMSSD is used for now
+        # (see the commented-out fallback in get_hrv_cv_score).
 
         # Group all filtered points by UTC date once; reused for every reference_date.
         by_day = self._group_by_day(filtered_hrv)

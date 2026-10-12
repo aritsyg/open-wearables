@@ -1,4 +1,5 @@
 import contextlib
+from collections import defaultdict
 from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal
 from typing import LiteralString, NamedTuple
@@ -1502,11 +1503,26 @@ class DataPointSeriesRepository(
         Filters by user (via DataSource), series type, and half-open interval
         [start_dt, end_dt), ordered by recorded_at ascending.
         """
+        return self.query_series_for_users(db_session, [user_id], type_id, start_dt, end_dt).get(user_id, [])
+
+    def query_series_for_users(
+        self,
+        db_session: DbSession,
+        user_ids: list[UUID],
+        type_id: int,
+        start_dt: datetime,
+        end_dt: datetime,
+    ) -> dict[UUID, list[tuple[datetime, float]]]:
+        """Batched query_series: one query for many users, grouped by user_id.
+
+        Each user's pairs keep the recorded_at ascending order. Users with no
+        matching points are absent from the returned dict.
+        """
         results = (
-            db_session.query(self.model.recorded_at, self.model.value)
+            db_session.query(DataSource.user_id, self.model.recorded_at, self.model.value)
             .join(DataSource, self.model.data_source_id == DataSource.id)
             .filter(
-                DataSource.user_id == user_id,
+                DataSource.user_id.in_(user_ids),
                 self.model.series_type_definition_id == type_id,
                 self.model.recorded_at >= start_dt,
                 self.model.recorded_at < end_dt,
@@ -1514,4 +1530,7 @@ class DataPointSeriesRepository(
             .order_by(self.model.recorded_at, self.model.id)
             .all()
         )
-        return [(row.recorded_at, float(row.value)) for row in results]
+        by_user: dict[UUID, list[tuple[datetime, float]]] = defaultdict(list)
+        for row in results:
+            by_user[row.user_id].append((row.recorded_at, float(row.value)))
+        return dict(by_user)
