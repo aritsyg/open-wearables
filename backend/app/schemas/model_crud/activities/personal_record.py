@@ -4,7 +4,7 @@ from datetime import date, datetime, timezone
 from typing import Any, Literal
 from uuid import UUID
 
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 from pydantic_core import PydanticCustomError
 
 Sex = Literal["female", "male"]
@@ -44,6 +44,8 @@ class PersonalRecordUpdate(PersonalRecordBase):
 
 
 class PersonalRecordResponse(PersonalRecordBase):
+    model_config = ConfigDict(from_attributes=True)
+
     user_id: UUID
     sex: Sex | None = Field(None, description=_SEX_DESCRIPTION)
 

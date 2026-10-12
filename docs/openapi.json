@@ -678,26 +678,6 @@
               }
             }
           },
-          "400": {
-            "description": "Validation error",
-            "content": {
-              "application/json": {
-                "example": {
-                  "detail": "Input should be a valid UUID"
-                }
-              }
-            }
-          },
-          "404": {
-            "description": "User not found",
-            "content": {
-              "application/json": {
-                "example": {
-                  "detail": "User with ID: 123e4567-e89b-12d3-a456-426614174000 not found."
-                }
-              }
-            }
-          },
           "422": {
             "description": "Validation Error",
             "content": {
@@ -767,26 +747,6 @@
               "application/json": {
                 "schema": {
                   "$ref": "#/components/schemas/PersonalRecordResponse"
-                }
-              }
-            }
-          },
-          "400": {
-            "description": "Validation error",
-            "content": {
-              "application/json": {
-                "example": {
-                  "detail": "birth_date cannot be in the future"
-                }
-              }
-            }
-          },
-          "404": {
-            "description": "User not found",
-            "content": {
-              "application/json": {
-                "example": {
-                  "detail": "User with ID: 123e4567-e89b-12d3-a456-426614174000 not found."
                 }
               }
             }
