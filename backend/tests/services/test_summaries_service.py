@@ -3,17 +3,20 @@
 from datetime import date, datetime, timedelta, timezone
 from logging import getLogger
 from typing import Any
-from uuid import uuid4
+from uuid import UUID, uuid4
 
 import pytest
 from sqlalchemy.orm import Session
 
-from app.schemas.enums import ProviderName
+from app.models import ProviderPriority
+from app.repositories import ProviderPriorityRepository
+from app.schemas.enums import HealthScoreCategory, ProviderName
 from app.services.summaries_service import SummariesService
 from tests.factories import (
     DataPointSeriesFactory,
     DataSourceFactory,
     EventRecordFactory,
+    HealthScoreFactory,
     PersonalRecordFactory,
     SeriesTypeDefinitionFactory,
     SleepDetailsFactory,
@@ -299,6 +302,79 @@ class TestGetRecoverySummaries:
         summary = result.data[0]
         assert summary.avg_hrv_sdnn_ms is None
         assert summary.avg_hrv_rmssd_ms == 63.2
+
+
+class TestRecoveryPagingPerDate:
+    """A page holds `limit` days, however many providers scored each one."""
+
+    DAYS = [date(2026, 1, day) for day in range(2, 7)]
+    START = _dt("2026-01-01T00:00:00+00:00")
+    END = _dt("2026-01-31T00:00:00+00:00")
+
+    def _two_providers_per_day(self, db: Session) -> Any:
+        """WHOOP and Polar both score every day; WHOOP wins each one.
+
+        The losing Polar score gets the lower id at the same timestamp, so within a day
+        it sorts first: a page cut between the two rows would elect Polar.
+        """
+        priorities = ProviderPriorityRepository(ProviderPriority)
+        priorities.upsert(db, ProviderName.WHOOP, 1)
+        priorities.upsert(db, ProviderName.POLAR, 2)
+        user = UserFactory()
+        whoop = DataSourceFactory(user=user, provider=ProviderName.WHOOP, source="whoop", device_type="band")
+        polar = DataSourceFactory(user=user, provider=ProviderName.POLAR, source="polar", device_type="watch")
+        for n, day in enumerate(self.DAYS):
+            scored_at = datetime(day.year, day.month, day.day, 7, tzinfo=timezone.utc)
+            for ds, provider, id_prefix in (
+                (polar, ProviderName.POLAR, "00000000"),
+                (whoop, ProviderName.WHOOP, "ffffffff"),
+            ):
+                HealthScoreFactory(
+                    id=UUID(f"{id_prefix}-0000-0000-0000-{n:012d}"),
+                    data_source=ds,
+                    provider=provider,
+                    category=HealthScoreCategory.RECOVERY,
+                    recorded_at=scored_at,
+                )
+        return user
+
+    @pytest.mark.parametrize("limit", [1, 2])
+    def test_pages_forward_through_every_day_once(self, db: Session, service: SummariesService, limit: int) -> None:
+        user = self._two_providers_per_day(db)
+
+        seen: list[tuple[date, str]] = []
+        has_more: list[bool] = []
+        cursor = None
+        while True:
+            page = service.get_recovery_summaries(db, user.id, self.START, self.END, cursor=cursor, limit=limit)
+            seen += [(summary.date, summary.source.provider) for summary in page.data]
+            has_more.append(page.pagination.has_more)
+            if not page.pagination.next_cursor:
+                break
+            cursor = page.pagination.next_cursor
+
+        assert seen == [(day, "whoop") for day in self.DAYS]
+        # ceil(5 / limit) pages, and only the last says there is nothing more.
+        assert has_more == [True] * (-(-len(self.DAYS) // limit) - 1) + [False]
+
+    def test_previous_cursor_returns_the_page_before(self, db: Session, service: SummariesService) -> None:
+        user = self._two_providers_per_day(db)
+        first = service.get_recovery_summaries(db, user.id, self.START, self.END, cursor=None, limit=2)
+        second = service.get_recovery_summaries(
+            db, user.id, self.START, self.END, cursor=first.pagination.next_cursor, limit=2
+        )
+        third = service.get_recovery_summaries(
+            db, user.id, self.START, self.END, cursor=second.pagination.next_cursor, limit=2
+        )
+
+        back = service.get_recovery_summaries(
+            db, user.id, self.START, self.END, cursor=third.pagination.previous_cursor, limit=2
+        )
+
+        assert sorted((s.date, s.source.provider) for s in back.data) == [
+            (self.DAYS[2], "whoop"),
+            (self.DAYS[3], "whoop"),
+        ]
 
 
 # ---------------------------------------------------------------------------
