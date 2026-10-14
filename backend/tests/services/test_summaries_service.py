@@ -362,7 +362,7 @@ class TestGetRecoverySummaries:
             "spo2_percentage": 98.4,
         }
         monkeypatch.setattr(service.health_score_repo, "get_recovery_summaries", lambda *_: [row])
-        monkeypatch.setattr(service, "_filter_by_priority", lambda *_args, **_kwargs: [row])
+        monkeypatch.setattr(service, "_priority_orders", lambda *_: ({}, {}))
 
         result = service.get_recovery_summaries(
             db_session=None,
@@ -428,8 +428,8 @@ class TestRecoveryPagingPerDate:
             cursor = page.pagination.next_cursor
 
         assert seen == [(day, "whoop") for day in self.DAYS]
-        # ceil(5 / limit) pages, and only the last says there is nothing more.
-        assert has_more == [True] * (-(-len(self.DAYS) // limit) - 1) + [False]
+        # Only the last page says there is nothing more
+        assert has_more == [True] * (math.ceil(len(self.DAYS) / limit) - 1) + [False]
 
     def test_previous_cursor_returns_the_page_before(self, db: Session, service: SummariesService) -> None:
         user = self._two_providers_per_day(db)

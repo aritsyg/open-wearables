@@ -55,10 +55,14 @@ UNRANKED_PRIORITY = 99
 def source_priority_order(
     provider_order: Mapping[ProviderName, int],
     device_type_order: Mapping[DeviceType, int],
+    provider_column: InstrumentedAttribute[str] | ColumnElement[str] = DataSource.provider,
 ) -> tuple[ColumnElement, ColumnElement, ColumnElement]:
-    """ORDER BY terms ranking sources best first: provider, device type, device model. Assumes ``DataSource``."""
+    """ORDER BY terms ranking sources best first: provider, device type, device model. Assumes ``DataSource``.
+
+    ``provider_column`` is for rows that carry their own provider and may have no source (health scores).
+    """
     provider_rank = (
-        case(*[(DataSource.provider == p, r) for p, r in provider_order.items()], else_=UNRANKED_PRIORITY)
+        case(*[(provider_column == p, r) for p, r in provider_order.items()], else_=UNRANKED_PRIORITY)
         if provider_order
         else literal(UNRANKED_PRIORITY)
     )

@@ -406,10 +406,8 @@ class SummariesService:
         resting_heart_rate, hrv_rmssd_milli, spo2_percentage.
         """
         results = self.health_score_repo.get_recovery_summaries(
-            db_session, user_id, start_date, end_date, cursor, limit
+            db_session, user_id, start_date, end_date, cursor, limit, *self._priority_orders(db_session)
         )
-
-        results = self._filter_by_priority(db_session, user_id, results, date_key="recovery_date")
 
         has_more = len(results) > limit
         if has_more:

@@ -3,13 +3,13 @@ from typing import Any
 from typing import cast as typing_cast
 from uuid import UUID
 
-from sqlalchemy import Date, and_, asc, cast, desc, select
+from sqlalchemy import Date, and_, asc, cast, desc, func, select, tuple_
 from sqlalchemy.dialects.postgresql import insert
 
 from app.database import DbSession
 from app.models import DataSource, HealthScore
-from app.repositories.repositories import CrudRepository
-from app.schemas.enums import HealthScoreCategory
+from app.repositories.repositories import CrudRepository, source_priority_order
+from app.schemas.enums import DeviceType, HealthScoreCategory, ProviderName
 from app.schemas.model_crud.activities import HealthScoreCreate, HealthScoreQueryParams, HealthScoreUpdate
 from app.utils.pagination import decode_cursor
 
@@ -108,72 +108,65 @@ class HealthScoreRepository(CrudRepository[HealthScore, HealthScoreCreate, Healt
         end_date: datetime,
         cursor: str | None,
         limit: int,
+        provider_order: dict[ProviderName, int],
+        device_type_order: dict[DeviceType, int],
     ) -> list[dict[str, Any]]:
         """Get recovery health scores for a date range with cursor-based pagination.
+
+        Per date only the highest-priority source's earliest score is kept, picked before pagination
+        so a page holds `limit` dates however many sources scored each day.
 
         Returns list of dicts with keys: recovery_date, provider, source, device_model,
         device_type, record_id, recorded_at, recovery_score, resting_heart_rate,
         hrv_rmssd_milli, spo2_percentage.
-        Pages by date: returns each source's first score of the day for the next limit + 1
-        dates after the cursor, so the caller can keep one score per date and still fill a
-        page and detect has_more without a separate COUNT query.
+        Fetches limit+1 rows so callers can detect has_more without a separate COUNT query.
         Ordering matches get_sleep_summaries: ASC by default, DESC when paginating backward.
         """
-        recovery_date = cast(HealthScore.recorded_at, Date)
-        recovery_filters = [
-            HealthScore.user_id == user_id,
-            HealthScore.category == HealthScoreCategory.RECOVERY,
-            HealthScore.recorded_at >= start_date,
-            HealthScore.recorded_at < end_date,
-        ]
-
-        # The page's dates. A date is one summary however many providers scored it, so
-        # the limit counts dates, and a date's scores are never split across pages. The
-        # cursor's record id is ignored: one summary per date makes the date enough.
-        page_dates = (
-            db_session.query(recovery_date.label("recovery_date")).filter(*recovery_filters).group_by(recovery_date)
-        )
-        backwards = False
-        if cursor:
-            cursor_ts, _, direction = decode_cursor(cursor)
-            backwards = direction == "prev"
-            if backwards:
-                page_dates = page_dates.filter(recovery_date < cursor_ts.date())
-            else:
-                page_dates = page_dates.filter(recovery_date > cursor_ts.date())
-        page_dates = page_dates.order_by(desc(recovery_date) if backwards else asc(recovery_date))
-        page_dates_subquery = page_dates.limit(limit + 1).subquery()
-
-        # A provider can send many scores a day (Suunto sends one per Balance sample),
-        # and the caller keeps a source's earliest score of the day anyway, so only that
-        # one is loaded.
-        first_per_source = (
-            db_session.query(HealthScore.id)
-            .filter(
-                *recovery_filters,
-                recovery_date.in_(select(page_dates_subquery.c.recovery_date)),
+        # Provider scores have no data_source, so the provider rank comes from the score itself
+        ranked = (
+            select(
+                HealthScore.id,
+                func.row_number()
+                .over(
+                    partition_by=cast(HealthScore.recorded_at, Date),
+                    order_by=(
+                        *source_priority_order(provider_order, device_type_order, HealthScore.provider),
+                        HealthScore.recorded_at,
+                        HealthScore.id,
+                    ),
+                )
+                .label("source_rank"),
             )
-            .distinct(recovery_date, HealthScore.provider, HealthScore.data_source_id)
-            .order_by(
-                recovery_date,
-                HealthScore.provider,
-                HealthScore.data_source_id,
-                asc(HealthScore.recorded_at),
-                asc(HealthScore.id),
+            .outerjoin(DataSource, HealthScore.data_source_id == DataSource.id)
+            .where(
+                HealthScore.user_id == user_id,
+                HealthScore.category == HealthScoreCategory.RECOVERY,
+                HealthScore.recorded_at >= start_date,
+                HealthScore.recorded_at < end_date,
             )
             .subquery()
         )
-
         # Outer join so scores without a data_source (older rows) still come back.
         query = (
             db_session.query(HealthScore, DataSource)
             .outerjoin(DataSource, HealthScore.data_source_id == DataSource.id)
-            .filter(HealthScore.id.in_(select(first_per_source.c.id)))
+            .filter(HealthScore.id.in_(select(ranked.c.id).where(ranked.c.source_rank == 1)))
         )
 
-        # Backward pagination returns the dates before the cursor, nearest first
-        date_order = desc(recovery_date) if backwards else asc(recovery_date)
-        rows = query.order_by(date_order, asc(HealthScore.recorded_at), asc(HealthScore.id)).all()
+        if cursor:
+            cursor_ts, cursor_id, direction = decode_cursor(cursor)
+            if direction == "prev":
+                query = query.filter(tuple_(HealthScore.recorded_at, HealthScore.id) < (cursor_ts, cursor_id)).order_by(
+                    desc(HealthScore.recorded_at), desc(HealthScore.id)
+                )
+            else:
+                query = query.filter(tuple_(HealthScore.recorded_at, HealthScore.id) > (cursor_ts, cursor_id)).order_by(
+                    asc(HealthScore.recorded_at), asc(HealthScore.id)
+                )
+        else:
+            query = query.order_by(asc(HealthScore.recorded_at), asc(HealthScore.id))
+
+        rows = query.limit(limit + 1).all()
 
         return [
             {
