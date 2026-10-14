@@ -1,5 +1,6 @@
 """Tests for SummariesService."""
 
+import math
 from datetime import date, datetime, timedelta, timezone
 from logging import getLogger
 from typing import Any
@@ -263,6 +264,79 @@ class TestGetSleepSummaries:
         assert len(result.data) == 3
         assert result.pagination.has_more is True
         assert result.pagination.next_cursor is not None
+
+
+class TestSleepPagingPerDate:
+    """A page holds `limit` nights, however many sources recorded each one."""
+
+    NIGHTS = [date(2026, 1, day) for day in range(2, 7)]
+    START = _dt("2026-01-01T00:00:00+00:00")
+    END = _dt("2026-01-31T00:00:00+00:00")
+
+    def _two_sources_per_night(self, db: Session) -> Any:
+        """Garmin and Oura both record every night; Garmin wins each one.
+
+        The losing Oura record gets the lower id, so within a night it sorts first:
+        a page cut between the two rows would elect Oura.
+        """
+        priorities = ProviderPriorityRepository(ProviderPriority)
+        priorities.upsert(db, ProviderName.GARMIN, 1)
+        priorities.upsert(db, ProviderName.OURA, 2)
+        user = UserFactory()
+        garmin = DataSourceFactory(user=user, provider=ProviderName.GARMIN, source="garmin", device_type="watch")
+        oura = DataSourceFactory(user=user, provider=ProviderName.OURA, source="oura", device_type="ring")
+        for n, night in enumerate(self.NIGHTS):
+            wake = datetime(night.year, night.month, night.day, 7, tzinfo=timezone.utc)
+            for ds, id_prefix in ((oura, "00000000"), (garmin, "ffffffff")):
+                EventRecordFactory(
+                    id=UUID(f"{id_prefix}-0000-0000-0000-{n:012d}"),
+                    data_source=ds,
+                    category="sleep",
+                    type="sleep",
+                    start_datetime=wake - timedelta(hours=8),
+                    end_datetime=wake,
+                    duration_seconds=8 * 3600,
+                    zone_offset="+00:00",
+                )
+        return user
+
+    @pytest.mark.parametrize("limit", [1, 2])
+    def test_pages_forward_through_every_night_once(self, db: Session, service: SummariesService, limit: int) -> None:
+        user = self._two_sources_per_night(db)
+
+        seen: list[tuple[date, str]] = []
+        has_more: list[bool] = []
+        cursor = None
+        while True:
+            page = service.get_sleep_summaries(db, user.id, self.START, self.END, cursor=cursor, limit=limit)
+            seen += [(summary.date, summary.source.provider) for summary in page.data]
+            has_more.append(page.pagination.has_more)
+            if not page.pagination.next_cursor:
+                break
+            cursor = page.pagination.next_cursor
+
+        assert seen == [(night, "garmin") for night in self.NIGHTS]
+        # Only the last page says there is nothing more
+        assert has_more == [True] * (math.ceil(len(self.NIGHTS) / limit) - 1) + [False]
+
+    def test_previous_cursor_returns_the_page_before(self, db: Session, service: SummariesService) -> None:
+        user = self._two_sources_per_night(db)
+        first = service.get_sleep_summaries(db, user.id, self.START, self.END, cursor=None, limit=2)
+        second = service.get_sleep_summaries(
+            db, user.id, self.START, self.END, cursor=first.pagination.next_cursor, limit=2
+        )
+        third = service.get_sleep_summaries(
+            db, user.id, self.START, self.END, cursor=second.pagination.next_cursor, limit=2
+        )
+
+        back = service.get_sleep_summaries(
+            db, user.id, self.START, self.END, cursor=third.pagination.previous_cursor, limit=2
+        )
+
+        assert sorted((s.date, s.source.provider) for s in back.data) == [
+            (night, "garmin") for night in self.NIGHTS[2:4]
+        ]
+        assert back.pagination.has_more is True
 
 
 # ---------------------------------------------------------------------------
