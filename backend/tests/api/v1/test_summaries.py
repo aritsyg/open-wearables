@@ -389,9 +389,9 @@ class TestSleepSummaryEndpoint:
         ring = DataSourceFactory(user=user, provider=ProviderName.OURA, device_type="ring")
         for day in range(1, 6):
             sleep_start = datetime(2025, 12, day, 23, 0, 0, tzinfo=timezone.utc)
-            for mapping in (watch, ring):
+            for data_source in (watch, ring):
                 EventRecordFactory(
-                    mapping=mapping,
+                    data_source=data_source,
                     category="sleep",
                     start_datetime=sleep_start,
                     end_datetime=sleep_start + timedelta(hours=8),

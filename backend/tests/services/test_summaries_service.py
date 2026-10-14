@@ -1,5 +1,6 @@
 """Tests for SummariesService."""
 
+import math
 from datetime import date, datetime, timedelta, timezone
 from logging import getLogger
 from typing import Any
@@ -314,8 +315,8 @@ class TestSleepPagingPerDate:
             cursor = page.pagination.next_cursor
 
         assert seen == [(night, "garmin") for night in self.NIGHTS]
-        # ceil(5 / limit) pages, and only the last says there is nothing more.
-        assert has_more == [True] * (-(-len(self.NIGHTS) // limit) - 1) + [False]
+        # Only the last page says there is nothing more
+        assert has_more == [True] * (math.ceil(len(self.NIGHTS) / limit) - 1) + [False]
 
     def test_previous_cursor_returns_the_page_before(self, db: Session, service: SummariesService) -> None:
         user = self._two_sources_per_night(db)
