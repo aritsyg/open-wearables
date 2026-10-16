@@ -71,16 +71,7 @@ def create_endpoint(body: EndpointCreateRequest, app_id: SvixAppId) -> EndpointR
 
 @router.get("/endpoints")
 def list_endpoints(app_id: SvixAppId) -> list[EndpointResponse]:
-    endpoints: list[EndpointResponse] = []
-    iterator: str | None = None
-    while True:
-        page = svix_service.list_endpoints(app_id, iterator=iterator)
-        endpoints.extend(_ep_to_response(ep) for ep in page.data)
-        if page.done or not page.iterator:
-            return endpoints
-        if page.iterator == iterator:
-            raise RuntimeError(f"Svix returned the same endpoint list iterator twice for app {app_id}")
-        iterator = page.iterator
+    return [_ep_to_response(ep) for ep in svix_service.iter_endpoints(app_id)]
 
 
 @router.get("/endpoints/{endpoint_id}")
