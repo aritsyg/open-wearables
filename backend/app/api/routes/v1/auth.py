@@ -3,14 +3,24 @@ from typing import Annotated
 from fastapi import APIRouter, Depends, HTTPException, status
 from fastapi.security import OAuth2PasswordRequestForm
 
-from app.config import settings
+from app.config import DEFAULT_ADMIN_PASSWORD, settings
 from app.database import DbSession
-from app.schemas.auth import TokenResponse
+from app.schemas.auth import PasswordChangePrompt, TokenResponse
 from app.schemas.model_crud.user_management import DeveloperRead, DeveloperUpdate, PasswordChange
 from app.services import DeveloperDep, developer_service, refresh_token_service
+from app.utils.config_utils import EnvironmentType
 from app.utils.security import create_access_token, verify_password
 
 router = APIRouter()
+
+
+def _password_change_prompt(password: str) -> PasswordChangePrompt | None:
+    """The seeded default is public, so an account still using it must be told to change it."""
+    if password != DEFAULT_ADMIN_PASSWORD:
+        return None
+    if settings.environment == EnvironmentType.PRODUCTION:
+        return PasswordChangePrompt.REQUIRED
+    return PasswordChangePrompt.RECOMMENDED
 
 
 @router.post("/login")
@@ -19,22 +29,14 @@ def login(
     db: DbSession,
 ) -> TokenResponse:
     """Authenticate developer and return access token with refresh token."""
-    # Find developer by email
-    developers = developer_service.crud.get_all(
-        db,
-        filters={"email": form_data.username},
-        offset=0,
-        limit=1,
-        sort_by=None,
-    )
-    if not developers:
+    developer = developer_service.get_by_email(db, form_data.username)
+    if not developer:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Incorrect email or password",
             headers={"WWW-Authenticate": "Bearer"},
         )
 
-    developer = developers[0]
     if not verify_password(form_data.password, developer.hashed_password):
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
@@ -50,6 +52,7 @@ def login(
         token_type="bearer",
         refresh_token=refresh_token,
         expires_in=settings.access_token_expire_minutes * 60,
+        password_change=_password_change_prompt(form_data.password),
     )
 
 
